@@ -1,4 +1,4 @@
-// Keyboard & mouse input manager with edge-triggered press tracking.
+// Keyboard & mouse input manager with edge-triggered press tracking + 3D mouse look/aim.
 
 export function createInput(canvas) {
   const keys = new Set();
@@ -6,9 +6,14 @@ export function createInput(canvas) {
   const mouse = {
     screenX: window.innerWidth * 0.5,
     screenY: window.innerHeight * 0.5,
+    ndcX: 0,
+    ndcY: 0,
+    dx: 0,
+    dy: 0,
     worldX: 0,
     worldY: 0,
     down: false,
+    rightDown: false,
     clicked: false,
   };
 
@@ -28,23 +33,35 @@ export function createInput(canvas) {
   window.addEventListener('blur', () => {
     keys.clear();
     mouse.down = false;
+    mouse.rightDown = false;
   });
+
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
   canvas.addEventListener('mousemove', (e) => {
     const rect = canvas.getBoundingClientRect();
-    mouse.screenX = e.clientX - rect.left;
-    mouse.screenY = e.clientY - rect.top;
+    const nx = e.clientX - rect.left;
+    const ny = e.clientY - rect.top;
+    mouse.dx += e.movementX || (nx - mouse.screenX);
+    mouse.dy += e.movementY || (ny - mouse.screenY);
+    mouse.screenX = nx;
+    mouse.screenY = ny;
+    mouse.ndcX = (nx / Math.max(1, rect.width)) * 2 - 1;
+    mouse.ndcY = -((ny / Math.max(1, rect.height)) * 2 - 1);
   });
 
   canvas.addEventListener('mousedown', (e) => {
     if (e.button === 0) {
       mouse.down = true;
       mouse.clicked = true;
+    } else if (e.button === 2) {
+      mouse.rightDown = true;
     }
   });
 
   window.addEventListener('mouseup', (e) => {
     if (e.button === 0) mouse.down = false;
+    else if (e.button === 2) mouse.rightDown = false;
   });
 
   return {
@@ -63,6 +80,8 @@ export function createInput(canvas) {
     endFrame() {
       pressed.clear();
       mouse.clicked = false;
+      mouse.dx = 0;
+      mouse.dy = 0;
     },
   };
 }

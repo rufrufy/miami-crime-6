@@ -5,9 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Miami Crime 6 — Solara Coast</title>
   <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.min.js"
+      }
+    }
+  </script>
 </head>
 <body>
   <canvas id="game"></canvas>
+  <div id="crosshair" class="crosshair hidden"></div>
 
   <!-- Live Game HUD -->
   <div id="hud" class="hud hidden">

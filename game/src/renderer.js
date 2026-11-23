@@ -1,1059 +1,871 @@
-// High-contrast 2.5D top-down Canvas renderer for Miami Crime 6 (Solara Coast).
-import { OUTFITS, PROTAGONISTS, ROAD_W, TIME_PHASES, WORLD_H, WORLD_W } from './config.js';
+// True 3D WebGL Renderer (Three.js) for Miami Crime 6 — Solara Coast.
+import * as THREE from 'three';
+import { OUTFITS, PROTAGONISTS, ROAD_W, WORLD_H, WORLD_W } from './config.js';
+import {
+  createAlligatorMesh,
+  createCharacterMesh,
+  createFacadeTexture,
+  createGlowSpriteTexture,
+  createGroundTexture,
+  createHelicopterMesh,
+  createRoadTexture,
+  createSignTexture,
+  createSkyTexture,
+  createSwampUFOMesh,
+  createTreeMesh,
+  createVehicleMesh,
+  createWaterTexture,
+} from './meshes.js';
 import { BRIDGES, H_ROADS, ISLANDS, V_ROADS } from './world.js';
 
-function shadeHex(hex, percent) {
-  if (!hex || hex[0] !== '#') return hex || '#888';
-  let num = parseInt(hex.slice(1), 16);
-  let r = Math.min(255, Math.max(0, ((num >> 16) & 255) + percent));
-  let g = Math.min(255, Math.max(0, ((num >> 8) & 255) + percent));
-  let b = Math.min(255, Math.max(0, (num & 255) + percent));
-  return `rgb(${r},${g},${b})`;
-}
+export function createRenderer3D(canvas) {
+  const renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: true,
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: true,
+  });
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.18;
 
-export function renderGame(ctx, state, width, height) {
-  const cam = state.camera;
-  const t = state.time;
-  const phase = TIME_PHASES[state.timeIndex] || TIME_PHASES[0];
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0xff8e72, 0.00044);
 
-  const shakeX = cam.shake > 0.1 ? (Math.sin(t * 73) * cam.shake) : 0;
-  const shakeY = cam.shake > 0.1 ? (Math.cos(t * 61) * cam.shake) : 0;
-  const viewL = cam.x - width * 0.5 + shakeX;
-  const viewT = cam.y - height * 0.5 + shakeY;
-  const viewR = viewL + width;
-  const viewB = viewT + height;
+  const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 2, 4200);
+  const raycaster = new THREE.Raycaster();
+  const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -8);
+  const rayHit = new THREE.Vector3();
 
-  ctx.save();
-  ctx.translate(-viewL, -viewT);
+  // ==================== LIGHTING & SKY ====================
+  const hemiLight = new THREE.HemisphereLight(0xffb5a7, 0x262344, 1.05);
+  scene.add(hemiLight);
 
-  // 1. BASE TERRAIN & BIOMES
-  drawTerrain(ctx, state, viewL, viewT, width, height, t);
+  const sunLight = new THREE.DirectionalLight(0xffc98b, 2.0);
+  sunLight.position.set(1600, 950, -900);
+  sunLight.castShadow = true;
+  sunLight.shadow.mapSize.set(1024, 1024);
+  sunLight.shadow.camera.near = 100;
+  sunLight.shadow.camera.far = 3000;
+  const sc = 900;
+  sunLight.shadow.camera.left = -sc;
+  sunLight.shadow.camera.right = sc;
+  sunLight.shadow.camera.top = sc;
+  sunLight.shadow.camera.bottom = -sc;
+  scene.add(sunLight);
+  scene.add(sunLight.target);
 
-  // 2. ROADS, BRIDGES, LANE MARKINGS & SKIDMARKS
-  drawRoadsAndBridges(ctx, state);
+  const skyTextures = {
+    sunset: createSkyTexture('sunset'),
+    day: createSkyTexture('day'),
+    night: createSkyTexture('night'),
+  };
+  const skyMat = new THREE.MeshBasicMaterial({ map: skyTextures.sunset, side: THREE.BackSide, fog: false });
+  const skyDome = new THREE.Mesh(new THREE.SphereGeometry(2600, 32, 22), skyMat);
+  scene.add(skyDome);
 
-  // 3. BEACH UMBRELLAS, LILY PADS, PICKUPS, INTERIORS & MISSION MARKER
-  drawWorldDetails(ctx, state, viewL, viewT, viewR, viewB, t);
+  // Soft glowing Sun & Moon sprites (zero hard ring artifacts!)
+  const sunGlowTex = createGlowSpriteTexture('#ffe07a', 'rgba(255, 92, 118, 0.55)');
+  const moonGlowTex = createGlowSpriteTexture('#d8eaff', 'rgba(130, 80, 255, 0.42)');
+  const celestialMat = new THREE.SpriteMaterial({ map: sunGlowTex, transparent: true, fog: false, depthWrite: false });
+  const celestialSprite = new THREE.Sprite(celestialMat);
+  celestialSprite.scale.set(420, 420, 1);
+  scene.add(celestialSprite);
 
-  // 4. VEHICLES
-  for (const v of state.vehicles) {
-    if (v.x < viewL - 120 || v.x > viewR + 120 || v.y < viewT - 120 || v.y > viewB + 120) continue;
-    drawVehicle(ctx, v, phase.lights, t);
-  }
+  // ==================== STATIC WORLD BUILDER ====================
+  let builtWorld = null;
+  let worldGroup = null;
+  let oceanTex = null;
+  let marshTex = null;
+  let ufoMesh = null;
+  let beaconOrb = null;
+  let facadeMats = [];
+  let lastTimeIndex = -1;
 
-  // 5. WILDLIFE (ALLIGATORS)
-  for (const g of state.wildlife.gators) {
-    if (g.dead) continue;
-    if (g.x < viewL - 90 || g.x > viewR + 90 || g.y < viewT - 90 || g.y > viewB + 90) continue;
-    drawAlligator(ctx, g, t);
-  }
+  function buildStaticWorld(world) {
+    if (worldGroup) scene.remove(worldGroup);
+    worldGroup = new THREE.Group();
+    scene.add(worldGroup);
+    facadeMats = [];
 
-  // 6. CHARACTERS (PEDESTRIANS, ENEMIES, POLICE, MARCO & ELENA)
-  for (const p of state.pedestrians) {
-    if (p.dead || p.x < viewL - 50 || p.x > viewR + 50 || p.y < viewT - 50 || p.y > viewB + 50) continue;
-    drawHuman(ctx, p.x, p.y, p.angle, p.shirt, '#2c3044', p.skin, p.hair, p.walkCycle, null, p.memory.state === 'filming');
-  }
-  for (const e of state.enemies) {
-    if (e.dead || e.x < viewL - 50 || e.x > viewR + 50 || e.y < viewT - 50 || e.y > viewB + 50) continue;
-    drawHuman(ctx, e.x, e.y, e.angle, '#c92a2a', '#1e1b24', '#d8a07a', '#1b1414', e.walkCycle, '#ffd166', false);
-  }
-  for (const cop of state.police.officers) {
-    if (cop.dead || cop.x < viewL - 50 || cop.x > viewR + 50 || cop.y < viewT - 50 || cop.y > viewB + 50) continue;
-    drawHuman(ctx, cop.x, cop.y, cop.angle, cop.swat ? '#1d2738' : '#254e8a', '#121a2a', '#ddb08b', '#141a24', cop.walkCycle, '#6df2ff', false, cop.swat ? 'swat' : 'cop');
-  }
+    const grassTex = createGroundTexture('#2e5247', 'rgba(80,155,105,0.16)', 'rgba(15,35,28,0.18)');
+    const sandTex = createGroundTexture('#f2d399', 'rgba(255,248,220,0.22)', 'rgba(205,162,98,0.22)');
+    const roadTex = createRoadTexture();
+    oceanTex = createWaterTexture(false);
+    marshTex = createWaterTexture(true);
 
-  const outfit = OUTFITS[state.player.outfitIndex] || OUTFITS[0];
-  for (const id of ['marco', 'elena']) {
-    const h = state.heroes[id];
-    if (h.vehicle) continue;
-    const spec = PROTAGONISTS[id];
-    const shirt = id === 'marco' ? outfit.marcoShirt : outfit.elenaShirt;
-    const isActive = state.player.activeId === id;
-    drawHeroMarker(ctx, h.x, h.y, spec.accent, isActive, t);
-    drawHuman(ctx, h.x, h.y, h.angle, shirt, outfit.pants, spec.skin, spec.hair, h.walkCycle, '#ffffff', false, id);
-  }
+    // Main terrain ground plane
+    const baseGround = new THREE.Mesh(
+      new THREE.PlaneGeometry(WORLD_W + 1200, WORLD_H + 1200),
+      new THREE.MeshStandardMaterial({ map: grassTex, roughness: 0.92 }),
+    );
+    baseGround.rotation.x = -Math.PI * 0.5;
+    baseGround.position.set(WORLD_W * 0.5, -0.2, WORLD_H * 0.5);
+    baseGround.receiveShadow = true;
+    worldGroup.add(baseGround);
 
-  // 7. 2.5D PERSPECTIVE-EXTRUDED ART DECO BUILDINGS
-  drawBuildings25D(ctx, state, cam.x, cam.y, viewL, viewT, viewR, viewB, phase.lights, t);
+    // Bayside Strip urban concrete slab
+    const citySlab = new THREE.Mesh(
+      new THREE.PlaneGeometry(1800, 1750),
+      new THREE.MeshStandardMaterial({ color: 0x3b4056, roughness: 0.9 }),
+    );
+    citySlab.rotation.x = -Math.PI * 0.5;
+    citySlab.position.set(2280, -0.08, 1260);
+    citySlab.receiveShadow = true;
+    worldGroup.add(citySlab);
 
-  // 8. SWAYING PALM TREES, PINES & CYPRESS CANOPIES
-  drawTrees(ctx, state, viewL, viewT, viewR, viewB, t);
+    // Golden Bayside Beach strip
+    const beach = new THREE.Mesh(
+      new THREE.PlaneGeometry(310, 1950),
+      new THREE.MeshStandardMaterial({ map: sandTex, roughness: 0.88 }),
+    );
+    beach.rotation.x = -Math.PI * 0.5;
+    beach.position.set(3275, 0.05, 1240);
+    beach.receiveShadow = true;
+    worldGroup.add(beach);
 
-  // 9. HIDDEN MYSTERY EFFECTS (SWAMP UFO, SHIPWRECK, GHOST BEACON)
-  drawMysteries(ctx, state, t);
+    // Animated Turquoise Ocean
+    const oceanMat = new THREE.MeshStandardMaterial({
+      map: oceanTex,
+      color: 0x24dfff,
+      roughness: 0.16,
+      metalness: 0.22,
+      transparent: true,
+      opacity: 0.92,
+    });
+    const eastOcean = new THREE.Mesh(new THREE.PlaneGeometry(1800, 3200), oceanMat);
+    eastOcean.rotation.x = -Math.PI * 0.5;
+    eastOcean.position.set(4280, 0.12, 1200);
+    worldGroup.add(eastOcean);
 
-  // 10. COMBAT VFX (BULLETS, EXPLOSIONS, PARTICLES, POPUPS)
-  drawCombatVFX(ctx, state);
+    const southOcean = new THREE.Mesh(new THREE.PlaneGeometry(3400, 1800), oceanMat);
+    southOcean.rotation.x = -Math.PI * 0.5;
+    southOcean.position.set(3460, 0.12, 3040);
+    worldGroup.add(southOcean);
 
-  // 11. COASTAL BIRDS & POLICE HELICOPTER + SEARCHLIGHT
-  drawBirdsAndHeli(ctx, state, t);
+    const harborWater = new THREE.Mesh(new THREE.PlaneGeometry(600, 1080), oceanMat);
+    harborWater.rotation.x = -Math.PI * 0.5;
+    harborWater.position.set(120, 0.12, 1540);
+    worldGroup.add(harborWater);
 
-  // 12. STREETLIGHT GLOW HALOS (SUNSET / NIGHT)
-  if (phase.lights > 0.1) {
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    for (const s of state.world.streetlights) {
-      if (s.x < viewL - 100 || s.x > viewR + 100 || s.y < viewT - 100 || s.y > viewB + 100) continue;
-      const g = ctx.createRadialGradient(s.x, s.y, 2, s.x, s.y, 64);
-      g.addColorStop(0, `rgba(255, 195, 110, ${0.34 * phase.lights})`);
-      g.addColorStop(0.5, `rgba(255, 120, 175, ${0.12 * phase.lights})`);
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, 64, 0, Math.PI * 2);
-      ctx.fill();
+    // Cypress Marsh emerald water lagoon (vibrant glowing wetland sheen)
+    const marshFloor = new THREE.Mesh(
+      new THREE.PlaneGeometry(1760, 1240),
+      new THREE.MeshStandardMaterial({ color: 0x244233, roughness: 0.92 }),
+    );
+    marshFloor.rotation.x = -Math.PI * 0.5;
+    marshFloor.position.set(880, 0.04, 2610);
+    worldGroup.add(marshFloor);
+
+    const marshWaterMat = new THREE.MeshStandardMaterial({
+      map: marshTex,
+      color: 0x2ca880,
+      emissive: 0x0d382c,
+      emissiveIntensity: 0.55,
+      roughness: 0.2,
+      metalness: 0.18,
+      transparent: true,
+      opacity: 0.92,
+    });
+    const marshLagoon = new THREE.Mesh(new THREE.CircleGeometry(540, 32), marshWaterMat);
+    marshLagoon.rotation.x = -Math.PI * 0.5;
+    marshLagoon.scale.set(1.05, 0.62, 1);
+    marshLagoon.position.set(940, 0.22, 2580);
+    worldGroup.add(marshLagoon);
+
+    const marshChannel = new THREE.Mesh(new THREE.PlaneGeometry(1560, 190), marshWaterMat);
+    marshChannel.rotation.x = -Math.PI * 0.5;
+    marshChannel.position.set(820, 0.2, 2330);
+    worldGroup.add(marshChannel);
+
+    // Coral Keys islands
+    for (const isl of ISLANDS) {
+      const sand = new THREE.Mesh(
+        new THREE.BoxGeometry(isl.w, 2.2, isl.h),
+        new THREE.MeshStandardMaterial({ map: sandTex, roughness: 0.9 }),
+      );
+      sand.position.set(isl.x + isl.w * 0.5, 0.3, isl.y + isl.h * 0.5);
+      worldGroup.add(sand);
+
+      const turf = new THREE.Mesh(
+        new THREE.BoxGeometry(isl.w - 64, 2.6, isl.h - 64),
+        new THREE.MeshStandardMaterial({ map: grassTex, roughness: 0.9 }),
+      );
+      turf.position.set(isl.x + isl.w * 0.5, 0.5, isl.y + isl.h * 0.5);
+      worldGroup.add(turf);
     }
-    ctx.restore();
-  }
 
-  ctx.restore();
+    // Pineridge Overlook green hill
+    const hill = new THREE.Mesh(
+      new THREE.CylinderGeometry(280, 480, 48, 20),
+      new THREE.MeshStandardMaterial({ color: 0x2b5c3e, roughness: 0.92 }),
+    );
+    hill.position.set(660, 18, 300);
+    worldGroup.add(hill);
 
-  // 13. ATMOSPHERIC TIME-OF-DAY COLOR GRADING & SUBTLE VIGNETTE
-  ctx.fillStyle = phase.tint;
-  ctx.fillRect(0, 0, width, height);
-
-  if (state.timeIndex === 0) {
-    // Golden hour warm coastal horizon glow from top-right
-    const sunGrad = ctx.createLinearGradient(0, 0, width, height);
-    sunGrad.addColorStop(0, 'rgba(255, 90, 140, 0.08)');
-    sunGrad.addColorStop(0.55, 'rgba(255, 160, 80, 0.04)');
-    sunGrad.addColorStop(1, 'rgba(30, 12, 60, 0.16)');
-    ctx.fillStyle = sunGrad;
-    ctx.fillRect(0, 0, width, height);
-  }
-
-  const vig = ctx.createRadialGradient(width * 0.5, height * 0.5, width * 0.34, width * 0.5, height * 0.5, width * 0.72);
-  vig.addColorStop(0, 'rgba(0,0,0,0)');
-  vig.addColorStop(1, 'rgba(8, 4, 20, 0.38)');
-  ctx.fillStyle = vig;
-  ctx.fillRect(0, 0, width, height);
-}
-
-function drawTerrain(ctx, state, viewL, viewT, width, height, t) {
-  // Base tropical urban turf / concrete ground
-  ctx.fillStyle = '#3b4f45';
-  ctx.fillRect(viewL - 20, viewT - 20, width + 40, height + 40);
-
-  // District turf tints
-  // Pineridge Overlook (north-west pine hills)
-  ctx.fillStyle = '#2d4c3b';
-  ctx.fillRect(0, 0, 1700, 1050);
-  // Topographic hill rings in Pineridge
-  ctx.strokeStyle = 'rgba(130, 210, 145, 0.14)';
-  ctx.lineWidth = 3;
-  for (let r = 120; r <= 420; r += 85) {
-    ctx.beginPath();
-    ctx.ellipse(660, 320, r * 1.35, r * 0.85, 0.1, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  // Solara Flats (sun-baked motel desert-coastal strip)
-  ctx.fillStyle = '#5c5548';
-  ctx.fillRect(1700, 0, 2500, 1050);
-
-  // Harbor Point (industrial concrete docks)
-  ctx.fillStyle = '#474f5c';
-  ctx.fillRect(0, 1050, 1400, 950);
-
-  // Bayside Strip (urban sidewalk blocks & tropical greenery)
-  ctx.fillStyle = '#3d4c53';
-  ctx.fillRect(1400, 1050, 2000, 1050);
-
-  // Cypress Marsh (deep mossy wetlands)
-  ctx.fillStyle = '#214032';
-  ctx.fillRect(0, 2000, 1800, 1200);
-
-  // Eastern & Southern Turquoise Ocean
-  const oceanGrad = ctx.createLinearGradient(3200, 0, 4200, 0);
-  oceanGrad.addColorStop(0, '#00c4d4');
-  oceanGrad.addColorStop(0.45, '#0096c7');
-  oceanGrad.addColorStop(1, '#023e8a');
-  ctx.fillStyle = oceanGrad;
-  ctx.fillRect(3340, 0, 900, 2240);
-  ctx.fillRect(1760, 2140, 2460, 1080);
-
-  // Harbor Point shipping basin water
-  ctx.fillStyle = '#0e5b78';
-  ctx.fillRect(0, 1020, 420, 1040);
-
-  // Cypress Marsh murky emerald waterways
-  ctx.fillStyle = '#124a42';
-  ctx.beginPath();
-  ctx.ellipse(940, 2580, 520, 300, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillRect(0, 2000, 340, 1200);
-  ctx.lineWidth = 148;
-  ctx.strokeStyle = '#124a42';
-  ctx.beginPath();
-  for (let x = 220; x <= 1700; x += 60) {
-    const y = 2320 + Math.sin(x * 0.007) * 90;
-    if (x === 220) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-
-  // Animated turquoise ocean wave shimmer lines
-  ctx.strokeStyle = 'rgba(180, 252, 255, 0.25)';
-  ctx.lineWidth = 2.5;
-  for (let wy = 180; wy < 3050; wy += 95) {
-    const off = Math.sin(t * 1.4 + wy * 0.02) * 26;
-    ctx.beginPath();
-    ctx.moveTo(3460 + off, wy);
-    ctx.quadraticCurveTo(3540 + off, wy - 14, 3620 + off, wy);
-    ctx.stroke();
-  }
-
-  // Bayside Golden Sandy Beach & animated surf foam
-  ctx.fillStyle = '#f2d399';
-  ctx.beginPath();
-  ctx.moveTo(3130, 380);
-  for (let y = 380; y <= 2160; y += 50) {
-    const wave = Math.sin(y * 0.0045) * 42 + Math.cos(y * 0.011) * 18;
-    ctx.lineTo(3380 + wave, y);
-  }
-  ctx.lineTo(3130, 2160);
-  ctx.closePath();
-  ctx.fill();
-
-  // White surf foam line
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.72)';
-  ctx.lineWidth = 5;
-  ctx.beginPath();
-  for (let y = 390; y <= 2150; y += 40) {
-    const wave = Math.sin(y * 0.0045) * 42 + Math.cos(y * 0.011) * 18 + Math.sin(t * 2.4 + y * 0.03) * 6;
-    if (y === 390) ctx.moveTo(3380 + wave, y);
-    else ctx.lineTo(3380 + wave, y);
-  }
-  ctx.stroke();
-
-  // Coral Keys Tropical Islands
-  for (const isl of ISLANDS) {
-    // Sand ring
-    ctx.fillStyle = '#f2d399';
-    roundRect(ctx, isl.x, isl.y, isl.w, isl.h, 64);
-    ctx.fill();
-    // Lush island interior
-    ctx.fillStyle = '#3e6e58';
-    roundRect(ctx, isl.x + 28, isl.y + 28, isl.w - 56, isl.h - 56, 44);
-    ctx.fill();
-  }
-}
-
-function drawRoadsAndBridges(ctx, state) {
-  // Sidewalk borders
-  ctx.fillStyle = '#757d8a';
-  for (const rx of V_ROADS) {
-    const maxY = rx === 740 ? 2040 : rx === 2960 ? 2700 : 2840;
-    ctx.fillRect(rx - ROAD_W * 0.5 - 12, 180, ROAD_W + 24, maxY - 180);
-  }
-  for (const ry of H_ROADS) {
-    const minX = ry === 2520 ? 1400 : 380;
-    ctx.fillRect(minX, ry - ROAD_W * 0.5 - 12, 3120 - minX, ROAD_W + 24);
-  }
-
-  // Crisp Asphalt Surface
-  ctx.fillStyle = '#252836';
-  for (const rx of V_ROADS) {
-    const maxY = rx === 740 ? 2040 : rx === 2960 ? 2700 : 2840;
-    ctx.fillRect(rx - ROAD_W * 0.5, 180, ROAD_W, maxY - 180);
-  }
-  for (const ry of H_ROADS) {
-    const minX = ry === 2520 ? 1400 : 380;
-    ctx.fillRect(minX, ry - ROAD_W * 0.5, 3120 - minX, ROAD_W);
-  }
-
-  // Wooden boat dock extending into Cypress Marsh lagoon
-  ctx.fillStyle = '#6e4c34';
-  ctx.fillRect(700, 2040, 80, 128);
-  ctx.strokeStyle = '#4a3120';
-  ctx.lineWidth = 2;
-  for (let dy = 2050; dy < 2166; dy += 12) {
-    ctx.beginPath();
-    ctx.moveTo(700, dy);
-    ctx.lineTo(780, dy);
-    ctx.stroke();
-  }
-
-  // Bridges over Coral Keys water
-  for (const b of BRIDGES) {
-    ctx.fillStyle = '#8b95a5';
-    ctx.fillRect(b.x - 10, b.y - 4, b.w + 20, b.h + 8);
-    ctx.fillStyle = '#2a2e3f';
-    ctx.fillRect(b.x, b.y, b.w, b.h);
-    // Neon bridge railings
-    ctx.fillStyle = '#00e5ff';
-    if (b.dir === 'v') {
-      ctx.fillRect(b.x - 6, b.y, 4, b.h);
-      ctx.fillRect(b.x + b.w + 2, b.y, 4, b.h);
-    } else {
-      ctx.fillRect(b.x, b.y - 6, b.w, 4);
-      ctx.fillRect(b.x, b.y + b.h + 2, b.w, 4);
+    // Asphalt Roads
+    const roadMatBase = new THREE.MeshStandardMaterial({ map: roadTex, roughness: 0.82 });
+    for (const rx of V_ROADS) {
+      const maxY = rx === 740 ? 2040 : rx === 2960 ? 2700 : 2850;
+      const len = maxY - 180;
+      const rTex = roadTex.clone();
+      rTex.needsUpdate = true;
+      rTex.repeat.set(1, len / 180);
+      const mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(ROAD_W, len),
+        new THREE.MeshStandardMaterial({ map: rTex, roughness: 0.82 }),
+      );
+      mesh.rotation.x = -Math.PI * 0.5;
+      mesh.position.set(rx, 0.28, 180 + len * 0.5);
+      mesh.receiveShadow = true;
+      worldGroup.add(mesh);
     }
-  }
-
-  // Dashed yellow centerlines
-  ctx.strokeStyle = '#ffd166';
-  ctx.lineWidth = 3;
-  ctx.setLineDash([22, 18]);
-  for (const rx of V_ROADS) {
-    const maxY = rx === 740 ? 2020 : rx === 2960 ? 2680 : 2820;
-    ctx.beginPath();
-    ctx.moveTo(rx, 200);
-    ctx.lineTo(rx, maxY);
-    ctx.stroke();
-  }
-  for (const ry of H_ROADS) {
-    const minX = ry === 2520 ? 1420 : 400;
-    ctx.beginPath();
-    ctx.moveTo(minX, ry);
-    ctx.lineTo(3100, ry);
-    ctx.stroke();
-  }
-  ctx.setLineDash([]);
-
-  // Crosswalks at intersections
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
-  for (const rx of V_ROADS) {
     for (const ry of H_ROADS) {
-      if (ry === 2520 && rx < 1400) continue;
-      for (let k = -40; k <= 40; k += 16) {
-        ctx.fillRect(rx + k - 3, ry - ROAD_W * 0.5 - 10, 6, 12);
-        ctx.fillRect(rx + k - 3, ry + ROAD_W * 0.5 - 2, 6, 12);
+      const minX = ry === 2520 ? 1400 : 380;
+      const len = 3120 - minX;
+      const rTex = roadTex.clone();
+      rTex.needsUpdate = true;
+      rTex.repeat.set(1, len / 180);
+      const mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(ROAD_W, len),
+        new THREE.MeshStandardMaterial({ map: rTex, roughness: 0.82 }),
+      );
+      mesh.rotation.x = -Math.PI * 0.5;
+      mesh.rotation.z = Math.PI * 0.5;
+      mesh.position.set(minX + len * 0.5, 0.3, ry);
+      mesh.receiveShadow = true;
+      worldGroup.add(mesh);
+    }
+
+    // 3D Causeway Bridges
+    const railMat = new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.5 });
+    for (const b of BRIDGES) {
+      const deck = new THREE.Mesh(new THREE.BoxGeometry(b.w, 4.5, b.h), roadMatBase);
+      deck.position.set(b.x + b.w * 0.5, 2.2, b.y + b.h * 0.5);
+      worldGroup.add(deck);
+      if (b.dir === 'v') {
+        const rL = new THREE.Mesh(new THREE.BoxGeometry(4, 7, b.h), railMat);
+        rL.position.set(b.x + 2, 6, b.y + b.h * 0.5);
+        const rR = rL.clone();
+        rR.position.x = b.x + b.w - 2;
+        worldGroup.add(rL, rR);
+      } else {
+        const rT = new THREE.Mesh(new THREE.BoxGeometry(b.w, 7, 4), railMat);
+        rT.position.set(b.x + b.w * 0.5, 6, b.y + 2);
+        const rB = rT.clone();
+        rB.position.z = b.y + b.h - 2;
+        worldGroup.add(rT, rB);
       }
     }
-  }
 
-  // Tire skidmarks
-  ctx.strokeStyle = 'rgba(12, 10, 18, 0.45)';
-  ctx.lineWidth = 4;
-  for (const s of state.world.skidmarks) {
-    ctx.beginPath();
-    ctx.moveTo(s.x1, s.y1);
-    ctx.lineTo(s.x1 + 3, s.y1 + 3);
-    ctx.moveTo(s.x2, s.y2);
-    ctx.lineTo(s.x2 + 3, s.y2 + 3);
-    ctx.stroke();
-  }
-}
-
-function drawWorldDetails(ctx, state, viewL, viewT, viewR, viewB, t) {
-  // Marsh Lily Pads
-  for (const lp of state.world.lilyPads) {
-    if (lp.x < viewL - 30 || lp.x > viewR + 30 || lp.y < viewT - 30 || lp.y > viewB + 30) continue;
-    ctx.fillStyle = '#2f9e44';
-    ctx.beginPath();
-    ctx.arc(lp.x, lp.y, lp.r, lp.angle + 0.3, lp.angle + Math.PI * 2 - 0.3);
-    ctx.lineTo(lp.x, lp.y);
-    ctx.fill();
-    if (lp.flower) {
-      ctx.fillStyle = '#ff8fab';
-      ctx.beginPath();
-      ctx.arc(lp.x, lp.y, 3.2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  // Beach Umbrellas & Towels
-  for (const p of state.world.props) {
-    if (p.x < viewL - 40 || p.x > viewR + 40 || p.y < viewT - 40 || p.y > viewB + 40) continue;
-    ctx.save();
-    ctx.translate(p.x, p.y);
-    ctx.rotate(p.angle);
-    // Towel
-    ctx.fillStyle = 'rgba(255,255,255,0.85)';
-    ctx.fillRect(-16, 10, 24, 11);
-    // Umbrella shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.22)';
-    ctx.beginPath();
-    ctx.arc(5, 5, 16, 0, Math.PI * 2);
-    ctx.fill();
-    // Umbrella canopy
-    ctx.fillStyle = p.color;
-    ctx.beginPath();
-    ctx.arc(0, 0, 16, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.arc(0, 0, 16, 0, Math.PI / 2);
-    ctx.moveTo(0, 0);
-    ctx.arc(0, 0, 16, Math.PI, Math.PI * 1.5);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // Enterable Interior Doorway Markers
-  const pulse = 0.75 + Math.sin(t * 4.5) * 0.25;
-  for (const it of state.world.interiors) {
-    ctx.save();
-    ctx.strokeStyle = it.neon;
-    ctx.lineWidth = 3;
-    ctx.globalAlpha = pulse;
-    ctx.beginPath();
-    ctx.arc(it.doorX, it.doorY, 20 + Math.sin(t * 4) * 3, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.fillStyle = it.neon;
-    ctx.globalAlpha = 0.22;
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // Pickups
-  for (const pk of state.world.pickups) {
-    if (!pk.active) continue;
-    const bob = Math.sin(t * 5 + pk.x) * 3;
-    const col = pk.kind === 'health' ? '#5ef29d' : pk.kind === 'armor' ? '#00e5ff' : pk.kind === 'cash' ? '#ffd166' : '#ff5eb8';
-    ctx.save();
-    ctx.fillStyle = col;
-    ctx.shadowColor = col;
-    ctx.shadowBlur = 12;
-    ctx.beginPath();
-    ctx.arc(pk.x, pk.y + bob, 10, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#0d0a1a';
-    ctx.font = 'bold 11px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    const sym = pk.kind === 'health' ? '+' : pk.kind === 'armor' ? 'A' : pk.kind === 'cash' ? '$' : 'W';
-    ctx.fillText(sym, pk.x, pk.y + bob + 1);
-    ctx.restore();
-  }
-
-  // Active Mission Gold Beacon Ring
-  if (state.missions.marker) {
-    const mk = state.missions.marker;
-    ctx.save();
-    ctx.strokeStyle = '#ffd166';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.arc(mk.x, mk.y, 34 + Math.sin(t * 5) * 6, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.fillStyle = 'rgba(255, 209, 102, 0.22)';
-    ctx.fill();
-    ctx.restore();
-  }
-}
-
-function drawVehicle(ctx, v, lightsStrength, t) {
-  ctx.save();
-  ctx.translate(v.x, v.y);
-  ctx.rotate(v.angle);
-
-  const L = v.h; // length along local X
-  const W = v.w; // width along local Y
-
-  // Boat water wake foam
-  if (v.boat && v.speed > 40) {
-    ctx.strokeStyle = 'rgba(220, 252, 255, 0.65)';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(-L * 0.5, -W * 0.3);
-    ctx.lineTo(-L * 0.5 - 32, -W * 0.75);
-    ctx.moveTo(-L * 0.5, W * 0.3);
-    ctx.lineTo(-L * 0.5 - 32, W * 0.75);
-    ctx.stroke();
-  }
-
-  // Headlight cones (golden hour & night)
-  if (lightsStrength > 0.15 && !v.dead) {
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    const cone = ctx.createLinearGradient(L * 0.45, 0, L * 0.45 + 150, 0);
-    cone.addColorStop(0, `rgba(255, 244, 195, ${0.42 * lightsStrength})`);
-    cone.addColorStop(1, 'rgba(255, 244, 195, 0)');
-    ctx.fillStyle = cone;
-    ctx.beginPath();
-    ctx.moveTo(L * 0.45, -W * 0.32);
-    ctx.lineTo(L * 0.45 + 150, -W * 1.45);
-    ctx.lineTo(L * 0.45 + 150, W * 1.45);
-    ctx.lineTo(L * 0.45, W * 0.32);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // Ground Shadow
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.38)';
-  roundRect(ctx, -L * 0.5 + 4, -W * 0.5 + 5, L, W, v.boat ? 14 : 7);
-  ctx.fill();
-
-  // Wheels (for land vehicles)
-  if (!v.boat) {
-    ctx.fillStyle = '#11131a';
-    ctx.fillRect(L * 0.2, -W * 0.5 - 2, 11, 4);
-    ctx.fillRect(L * 0.2, W * 0.5 - 2, 11, 4);
-    ctx.fillRect(-L * 0.35, -W * 0.5 - 2, 11, 4);
-    ctx.fillRect(-L * 0.35, W * 0.5 - 2, 11, 4);
-  }
-
-  // Main Chassis
-  ctx.fillStyle = v.dead ? '#2b2d34' : v.color;
-  if (v.boat) {
-    ctx.beginPath();
-    ctx.moveTo(L * 0.56, 0);
-    ctx.quadraticCurveTo(L * 0.25, -W * 0.54, -L * 0.5, -W * 0.48);
-    ctx.lineTo(-L * 0.5, W * 0.48);
-    ctx.quadraticCurveTo(L * 0.25, W * 0.54, L * 0.56, 0);
-    ctx.closePath();
-    ctx.fill();
-    // Boat deck stripe
-    ctx.fillStyle = '#00e5ff';
-    ctx.fillRect(-L * 0.35, -W * 0.14, L * 0.65, W * 0.28);
-  } else {
-    roundRect(ctx, -L * 0.5, -W * 0.5, L, W, 7);
-    ctx.fill();
-
-    // Police white doors + hood stripe
-    if (v.type === 'police') {
-      ctx.fillStyle = '#f8f9fa';
-      ctx.fillRect(-L * 0.16, -W * 0.48, L * 0.32, W * 0.96);
-    } else if (v.type === 'taxi') {
-      ctx.fillStyle = '#111';
-      ctx.fillRect(-L * 0.1, -W * 0.48, L * 0.18, W * 0.96);
-    } else if (v.type === 'coupe' || v.type === 'muscle') {
-      // Racing twin stripes
-      ctx.fillStyle = 'rgba(255,255,255,0.28)';
-      ctx.fillRect(-L * 0.45, -4, L * 0.9, 3);
-      ctx.fillRect(-L * 0.45, 2, L * 0.9, 3);
-    }
-
-    // Windshield & rear glass
-    ctx.fillStyle = '#151b2e';
-    roundRect(ctx, L * 0.05, -W * 0.38, L * 0.22, W * 0.76, 3);
-    ctx.fill();
-    roundRect(ctx, -L * 0.32, -W * 0.34, L * 0.16, W * 0.68, 3);
-    ctx.fill();
-
-    // Headlights & Taillights
-    ctx.fillStyle = '#fff5c0';
-    ctx.fillRect(L * 0.46, -W * 0.38, 3, 6);
-    ctx.fillRect(L * 0.46, W * 0.38 - 6, 3, 6);
-    ctx.fillStyle = '#ff2a55';
-    ctx.fillRect(-L * 0.5, -W * 0.38, 3, 7);
-    ctx.fillRect(-L * 0.5, W * 0.38 - 7, 3, 7);
-  }
-
-  // Nitro exhaust flame!
-  if (v.nitroActive) {
-    ctx.fillStyle = '#00e5ff';
-    ctx.beginPath();
-    ctx.moveTo(-L * 0.5, -6);
-    ctx.lineTo(-L * 0.5 - 24 - Math.random() * 12, 0);
-    ctx.lineTo(-L * 0.5, 6);
-    ctx.fill();
-  }
-
-  // Police flashing red/blue lightbar + glow halo
-  if (v.siren) {
-    const flash = Math.floor(t * 10) % 2 === 0;
-    ctx.fillStyle = flash ? '#ff2a55' : '#00d2ff';
-    ctx.fillRect(-4, -W * 0.34, 8, W * 0.34);
-    ctx.fillStyle = flash ? '#00d2ff' : '#ff2a55';
-    ctx.fillRect(-4, 0, 8, W * 0.34);
-
-    if (v.sirenOn) {
-      ctx.save();
-      ctx.globalCompositeOperation = 'lighter';
-      const g = ctx.createRadialGradient(0, flash ? -8 : 8, 2, 0, flash ? -8 : 8, 52);
-      g.addColorStop(0, flash ? 'rgba(255, 42, 85, 0.72)' : 'rgba(0, 210, 255, 0.72)');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(0, flash ? -8 : 8, 52, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  ctx.restore();
-}
-
-function drawHeroMarker(ctx, x, y, color, isActive, t) {
-  ctx.save();
-  ctx.strokeStyle = color;
-  ctx.lineWidth = isActive ? 2.5 : 1.5;
-  ctx.globalAlpha = isActive ? 0.85 : 0.45;
-  ctx.beginPath();
-  ctx.arc(x, y, isActive ? 18 + Math.sin(t * 6) * 2 : 14, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.restore();
-}
-
-function drawHuman(ctx, x, y, angle, shirt, pants, skin, hair, walkCycle, gunColor, filming = false, badge = null) {
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(angle);
-
-  // Soft shadow
-  ctx.fillStyle = 'rgba(0,0,0,0.34)';
-  ctx.beginPath();
-  ctx.ellipse(2, 4, 11, 9, 0, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Animated feet
-  const stride = Math.sin(walkCycle) * 4;
-  ctx.fillStyle = pants;
-  ctx.fillRect(-3 + stride, -7, 7, 5);
-  ctx.fillRect(-3 - stride, 2, 7, 5);
-
-  // Torso / shoulders
-  ctx.fillStyle = shirt;
-  roundRect(ctx, -6, -10, 12, 20, 5);
-  ctx.fill();
-
-  // Held weapon or filming phone
-  if (filming) {
-    ctx.fillStyle = '#00e5ff';
-    ctx.fillRect(7, 2, 5, 8);
-  } else if (gunColor) {
-    ctx.fillStyle = '#1b1d28';
-    ctx.fillRect(4, 2, 13, 4);
-    ctx.fillStyle = gunColor;
-    ctx.fillRect(14, 3, 4, 2);
-  }
-
-  // Head
-  ctx.fillStyle = skin;
-  ctx.beginPath();
-  ctx.arc(0, 0, 6.5, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Hair or Police/SWAT helmet
-  ctx.fillStyle = badge === 'swat' ? '#101824' : badge === 'cop' ? '#1c3b70' : hair;
-  ctx.beginPath();
-  ctx.arc(-1.5, 0, 6.2, Math.PI * 0.45, Math.PI * 1.55);
-  ctx.fill();
-
-  ctx.restore();
-}
-
-function drawAlligator(ctx, g, t) {
-  ctx.save();
-  ctx.translate(g.x, g.y);
-  ctx.rotate(g.angle);
-
-  const sway = Math.sin(g.swimPhase) * 5;
-  // Water ripples around gator
-  ctx.strokeStyle = 'rgba(180, 255, 220, 0.35)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.ellipse(0, 0, 34 + Math.sin(t * 4 + g.id) * 3, 14, 0, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // Articulated tail
-  ctx.fillStyle = '#2b5930';
-  ctx.beginPath();
-  ctx.moveTo(-14, -6);
-  ctx.lineTo(-42, sway);
-  ctx.lineTo(-14, 6);
-  ctx.closePath();
-  ctx.fill();
-
-  // Legs
-  ctx.fillStyle = '#386e3d';
-  ctx.fillRect(-10, -13, 8, 6);
-  ctx.fillRect(-10, 7, 8, 6);
-  ctx.fillRect(6, -12, 8, 6);
-  ctx.fillRect(6, 6, 8, 6);
-
-  // Body + armored back ridges
-  ctx.fillStyle = '#346638';
-  roundRect(ctx, -18, -9, 34, 18, 7);
-  ctx.fill();
-  ctx.fillStyle = '#1e3d21';
-  for (let rx = -12; rx <= 8; rx += 6) {
-    ctx.fillRect(rx, -4, 3, 8);
-  }
-
-  // Snout + snapping jaw
-  ctx.fillStyle = '#3d7a42';
-  roundRect(ctx, 12, -6, 18, 12, 5);
-  ctx.fill();
-
-  // Glowing yellow eyes when aggro
-  ctx.fillStyle = g.aggro ? '#ffd166' : '#a9e34b';
-  ctx.beginPath();
-  ctx.arc(14, -4, 2, 0, Math.PI * 2);
-  ctx.arc(14, 4, 2, 0, Math.PI * 2);
-  ctx.fill();
-
-  ctx.restore();
-}
-
-function drawBuildings25D(ctx, state, camX, camY, viewL, viewT, viewR, viewB, lightsStrength, t) {
-  // Sort buildings back-to-front by distance from camera so tall rooftops layer cleanly
-  const visible = [];
-  for (const b of state.world.buildings) {
-    if (b.x + b.w < viewL - 140 || b.x > viewR + 140 || b.y + b.h < viewT - 140 || b.y > viewB + 140) continue;
-    const cx = b.x + b.w * 0.5;
-    const cy = b.y + b.h * 0.5;
-    const dist2 = (cx - camX) * (cx - camX) + (cy - camY) * (cy - camY);
-    visible.push({ b, cx, cy, dist2 });
-  }
-  visible.sort((a, b) => b.dist2 - a.dist2);
-
-  for (const { b, cx, cy } of visible) {
-    const scale = b.height * 0.0022;
-    const ox = Math.max(-75, Math.min(75, (cx - camX) * scale));
-    const oy = Math.max(-75, Math.min(75, (cy - camY) * scale));
-
-    const rx = b.x + ox;
-    const ry = b.y + oy;
-
-    // Ground drop shadow
-    ctx.fillStyle = 'rgba(10, 6, 22, 0.34)';
-    ctx.fillRect(b.x + 12, b.y + 14, b.w, b.h);
-
-    // 3D Extruded Side Walls (quad polygons connecting base corners to roof corners)
-    const wallDark = shadeHex(b.wall, -38);
-    const wallMid = shadeHex(b.wall, -16);
-
-    // South wall
-    if (oy < 0) {
-      drawQuad(ctx, b.x, b.y + b.h, b.x + b.w, b.y + b.h, rx + b.w, ry + b.h, rx, ry + b.h, wallDark);
-      drawWallWindows(ctx, b.x, b.y + b.h, b.x + b.w, b.y + b.h, rx + b.w, ry + b.h, rx, ry + b.h, lightsStrength);
-    }
-    // North wall
-    if (oy > 0) {
-      drawQuad(ctx, b.x, b.y, b.x + b.w, b.y, rx + b.w, ry, rx, ry, wallMid);
-      drawWallWindows(ctx, b.x, b.y, b.x + b.w, b.y, rx + b.w, ry, rx, ry, lightsStrength);
-    }
-    // East wall
-    if (ox < 0) {
-      drawQuad(ctx, b.x + b.w, b.y, b.x + b.w, b.y + b.h, rx + b.w, ry + b.h, rx + b.w, ry, wallDark);
-      drawWallWindows(ctx, b.x + b.w, b.y, b.x + b.w, b.y + b.h, rx + b.w, ry + b.h, rx + b.w, ry, lightsStrength);
-    }
-    // West wall
-    if (ox > 0) {
-      drawQuad(ctx, b.x, b.y, b.x, b.y + b.h, rx, ry + b.h, rx, ry, wallMid);
-      drawWallWindows(ctx, b.x, b.y, b.x, b.y + b.h, rx, ry + b.h, rx, ry, lightsStrength);
-    }
-
-    // Rooftop base
-    ctx.fillStyle = b.roof;
-    ctx.fillRect(rx, ry, b.w, b.h);
-    ctx.strokeStyle = b.neon || 'rgba(255,255,255,0.2)';
-    ctx.lineWidth = b.neon ? 2.5 : 1.5;
-    ctx.strokeRect(rx + 1, ry + 1, b.w - 2, b.h - 2);
-
-    // Rooftop Details
-    if (b.style === 'pool') {
-      ctx.fillStyle = '#00e5ff';
-      ctx.fillRect(rx + 16, ry + 16, Math.max(24, b.w - 32), Math.max(20, b.h - 32));
-      ctx.fillStyle = 'rgba(255,255,255,0.35)';
-      ctx.fillRect(rx + 22, ry + 22, Math.max(10, b.w - 54), 5);
-    } else if (b.style === 'helipad') {
-      const hcx = rx + b.w * 0.5;
-      const hcy = ry + b.h * 0.5;
-      ctx.strokeStyle = '#ffd166';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(hcx, hcy, Math.min(b.w, b.h) * 0.3, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#ffd166';
-      ctx.font = 'bold 20px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('H', hcx, hcy + 1);
-    } else if (b.style === 'container') {
-      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-      ctx.lineWidth = 2;
-      for (let sy = ry + 10; sy < ry + b.h - 6; sy += 12) {
-        ctx.beginPath();
-        ctx.moveTo(rx + 4, sy);
-        ctx.lineTo(rx + b.w - 4, sy);
-        ctx.stroke();
+    // Art Deco Skyscrapers + Iconic Bayside Boulevard Skyline Towers
+    const facadeCache = new Map();
+    const getFacadeMat = (wall, neon) => {
+      const key = `${wall}|${neon || ''}`;
+      if (!facadeCache.has(key)) {
+        const tex = createFacadeTexture(wall, neon);
+        const mat = new THREE.MeshStandardMaterial({
+          map: tex,
+          roughness: 0.42,
+          metalness: 0.15,
+          emissive: new THREE.Color(wall),
+          emissiveMap: tex,
+          emissiveIntensity: 0.35,
+        });
+        facadeCache.set(key, mat);
+        facadeMats.push(mat);
       }
-    } else if (b.style === 'tower') {
-      const tcx = rx + b.w * 0.5;
-      const tcy = ry + b.h * 0.5;
-      ctx.strokeStyle = '#ff3864';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(tcx, tcy, 16 + Math.sin(t * 5) * 6, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#ff3864';
-      ctx.beginPath();
-      ctx.arc(tcx, tcy, 7, 0, Math.PI * 2);
-      ctx.fill();
+      return facadeCache.get(key);
+    };
+
+    // Extra iconic Bayside Boulevard Art Deco skyline towers along the west side of the Strip (x=2770..2865)
+    const skylineDecor = [
+      { x: 2775, y: 970, w: 105, h: 115, height: 155, wall: '#ff9ebb', roof: '#2a1d44', neon: '#ff3b9a', label: 'HOTEL SOLARA' },
+      { x: 2780, y: 780, w: 100, h: 120, height: 185, wall: '#72efdd', roof: '#1d2d44', neon: '#00f0ff', label: 'CORAL TOWERS' },
+      { x: 2785, y: 600, w: 96, h: 108, height: 145, wall: '#cdb4db', roof: '#2c2046', neon: '#ffd166', label: 'OCEAN PLAZA' },
+      { x: 2560, y: 940, w: 130, h: 120, height: 195, wall: '#a0c4ff', roof: '#1b2640', neon: '#00e5ff' },
+      { x: 2360, y: 950, w: 125, h: 115, height: 175, wall: '#ffd6a5', roof: '#3a2444', neon: '#ff5eb8' },
+    ];
+
+    const allBuildings = [...world.buildings, ...skylineDecor];
+
+    for (const b of allBuildings) {
+      const h = b.height * 1.18;
+      const cx = b.x + b.w * 0.5;
+      const cz = b.y + b.h * 0.5;
+
+      if (b.style === 'container') {
+        const cont = new THREE.Mesh(
+          new THREE.BoxGeometry(b.w, h, b.h),
+          new THREE.MeshStandardMaterial({ color: new THREE.Color(b.wall), roughness: 0.65, metalness: 0.2 }),
+        );
+        cont.position.set(cx, h * 0.5, cz);
+        cont.castShadow = true;
+        cont.receiveShadow = true;
+        worldGroup.add(cont);
+        continue;
+      }
+
+      if (b.style === 'tower') {
+        const base = new THREE.Mesh(new THREE.BoxGeometry(b.w, 28, b.h), new THREE.MeshStandardMaterial({ color: 0x455a64 }));
+        base.position.set(cx, 38, cz);
+        worldGroup.add(base);
+        const mast = new THREE.Mesh(
+          new THREE.CylinderGeometry(2.5, 14, 210, 4),
+          new THREE.MeshStandardMaterial({ color: 0xcfd8dc, wireframe: true }),
+        );
+        mast.position.set(cx, 150, cz);
+        worldGroup.add(mast);
+        beaconOrb = new THREE.Mesh(
+          new THREE.SphereGeometry(8, 12, 12),
+          new THREE.MeshBasicMaterial({ color: 0xc77dff }),
+        );
+        beaconOrb.position.set(cx, 258, cz);
+        worldGroup.add(beaconOrb);
+        continue;
+      }
+
+      const sideMat = getFacadeMat(b.wall, b.neon);
+      const roofMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(b.roof || '#242038'), roughness: 0.7 });
+      const bMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(b.w, h, b.h),
+        [sideMat, sideMat, roofMat, roofMat, sideMat, sideMat],
+      );
+      bMesh.position.set(cx, h * 0.5, cz);
+      bMesh.castShadow = true;
+      bMesh.receiveShadow = true;
+      worldGroup.add(bMesh);
+
+      // Stepped Art Deco setback crown + neon vertical accent strips
+      if (h > 90) {
+        const crownH = 28 + (h % 32);
+        const crown = new THREE.Mesh(
+          new THREE.BoxGeometry(b.w * 0.66, crownH, b.h * 0.66),
+          [sideMat, sideMat, roofMat, roofMat, sideMat, sideMat],
+        );
+        crown.position.set(cx, h + crownH * 0.5, cz);
+        crown.castShadow = true;
+        worldGroup.add(crown);
+
+        if (b.neon) {
+          const spire = new THREE.Mesh(
+            new THREE.CylinderGeometry(1.4, 3.0, 32, 6),
+            new THREE.MeshBasicMaterial({ color: new THREE.Color(b.neon) }),
+          );
+          spire.position.set(cx, h + crownH + 16, cz);
+          worldGroup.add(spire);
+        }
+      }
+
+      if (b.neon) {
+        const trimMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(b.neon) });
+        const trim = new THREE.Mesh(new THREE.BoxGeometry(b.w + 2.6, 3.6, b.h + 2.6), trimMat);
+        trim.position.set(cx, h - 1.5, cz);
+        worldGroup.add(trim);
+      }
+
+      // Single-sided crisp 3D Neon Landmark Billboard (no mirrored back-face!)
+      if (b.label) {
+        const signTex = createSignTexture(b.label, b.neon || '#ffd166');
+        const signMat = new THREE.MeshBasicMaterial({ map: signTex, side: THREE.FrontSide });
+        const signW = Math.min(b.w * 0.94, 152);
+        const sign = new THREE.Mesh(new THREE.PlaneGeometry(signW, 32), signMat);
+        sign.position.set(cx, h + 17, b.y + b.h + 1.5);
+        worldGroup.add(sign);
+      }
+    }
+
+    // 3D Trees + Extra Cypress Trees framing the Cypress Marsh lagoon
+    const extraMarshTrees = [
+      { x: 690, y: 2515, kind: 'cypress', radius: 30, phase: 0.4 },
+      { x: 710, y: 2710, kind: 'cypress', radius: 32, phase: 1.5 },
+      { x: 1080, y: 2510, kind: 'cypress', radius: 28, phase: 2.1 },
+      { x: 1095, y: 2690, kind: 'cypress', radius: 31, phase: 0.9 },
+    ];
+    for (const t of [...world.trees, ...extraMarshTrees]) {
+      const scale = Math.max(0.75, Math.min(1.45, t.radius / 22));
+      const tree = createTreeMesh(t.kind, scale);
+      tree.position.set(t.x, 0, t.y);
+      tree.rotation.y = t.phase;
+      worldGroup.add(tree);
+    }
+
+    // Beach Umbrellas + Lifeguard Tower
+    const poleMat = new THREE.MeshStandardMaterial({ color: 0xe8e4d8 });
+    for (const p of world.props) {
+      if (p.type === 'umbrella') {
+        const ug = new THREE.Group();
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 13, 6), poleMat);
+        pole.position.y = 6.5;
+        const cap = new THREE.Mesh(
+          new THREE.ConeGeometry(10, 4.5, 8),
+          new THREE.MeshStandardMaterial({ color: new THREE.Color(p.color), roughness: 0.6 }),
+        );
+        cap.position.y = 13;
+        ug.add(pole, cap);
+        ug.position.set(p.x, 0, p.y);
+        worldGroup.add(ug);
+      }
+    }
+
+    const lg = new THREE.Group();
+    const lgDeck = new THREE.Mesh(new THREE.BoxGeometry(22, 16, 22), new THREE.MeshStandardMaterial({ color: 0x00e5ff }));
+    lgDeck.position.y = 16;
+    const lgRoof = new THREE.Mesh(new THREE.ConeGeometry(19, 9, 4), new THREE.MeshStandardMaterial({ color: 0xff4d9d }));
+    lgRoof.rotation.y = Math.PI * 0.25;
+    lgRoof.position.y = 28;
+    const lgStilts = new THREE.Mesh(new THREE.BoxGeometry(18, 12, 18), new THREE.MeshStandardMaterial({ color: 0xf4f1de, wireframe: true }));
+    lgStilts.position.y = 6;
+    lg.add(lgStilts, lgDeck, lgRoof);
+    lg.position.set(3240, 0, 1360);
+    worldGroup.add(lg);
+
+    // Streetlights with subtle warm ground pools
+    const lampPoleMat = new THREE.MeshStandardMaterial({ color: 0x3b4259, metalness: 0.6 });
+    const lampBulbMat = new THREE.MeshBasicMaterial({ color: 0xffe8a8 });
+    for (const sl of world.streetlights) {
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.6, 36, 6), lampPoleMat);
+      pole.position.set(sl.x, 18, sl.y);
+      const bulb = new THREE.Mesh(new THREE.SphereGeometry(2.8, 8, 8), lampBulbMat);
+      bulb.position.set(sl.x - sl.side * 5, 36, sl.y);
+      worldGroup.add(pole, bulb);
+    }
+
+    // Cypress Marsh Lily Pads
+    const padMat = new THREE.MeshStandardMaterial({ color: 0x45c46a, roughness: 0.7 });
+    for (const lp of world.lilyPads) {
+      const pad = new THREE.Mesh(new THREE.CylinderGeometry(lp.r, lp.r, 0.6, 10), padMat);
+      pad.position.set(lp.x, 0.4, lp.y);
+      worldGroup.add(pad);
+    }
+
+    // Swamp UFO Anomaly
+    const ufoData = world.mysteries.find((m) => m.id === 'ufo');
+    if (ufoData) {
+      ufoMesh = createSwampUFOMesh();
+      ufoMesh.position.set(ufoData.x, 108, ufoData.y);
+      worldGroup.add(ufoMesh);
+    }
+
+    // Coral Reef Shipwreck
+    const shipData = world.mysteries.find((m) => m.id === 'shipwreck');
+    if (shipData) {
+      const ship = new THREE.Group();
+      const shipWoodMat = new THREE.MeshStandardMaterial({ color: 0x6b4423, roughness: 0.9 });
+      const hull = new THREE.Mesh(new THREE.BoxGeometry(64, 14, 24), shipWoodMat);
+      hull.rotation.z = 0.24;
+      const mast = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 2.2, 42, 6), shipWoodMat);
+      mast.position.set(4, 18, 0);
+      mast.rotation.z = 0.35;
+      const gold = new THREE.Mesh(new THREE.BoxGeometry(10, 6, 8), new THREE.MeshBasicMaterial({ color: 0xffd166 }));
+      gold.position.set(-10, 6, 0);
+      ship.add(hull, mast, gold);
+      ship.position.set(shipData.x, 1, shipData.y);
+      worldGroup.add(ship);
+    }
+
+    // Enterable Interior Glowing Cyan Portal Rings
+    const portalRingGeo = new THREE.TorusGeometry(15, 2.0, 8, 24);
+    portalRingGeo.rotateX(Math.PI * 0.5);
+    const portalMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.85 });
+    for (const it of world.interiors) {
+      const ring = new THREE.Mesh(portalRingGeo, portalMat);
+      ring.position.set(it.doorX, 2.0, it.doorY);
+      worldGroup.add(ring);
+    }
+
+    builtWorld = world;
+  }
+
+  // ==================== DYNAMIC ENTITY SYNC ====================
+  const dynGroup = new THREE.Group();
+  scene.add(dynGroup);
+
+  const vehicleMap = new Map();
+  const charMap = new Map();
+  const gatorMap = new Map();
+
+  const heroMeshes = {
+    marco: createCharacterMesh({ ...PROTAGONISTS.marco, armed: true, sunglasses: true }),
+    elena: createCharacterMesh({ ...PROTAGONISTS.elena, armed: true, sunglasses: true }),
+  };
+  dynGroup.add(heroMeshes.marco, heroMeshes.elena);
+
+  const heliMesh = createHelicopterMesh();
+  heliMesh.visible = false;
+  dynGroup.add(heliMesh);
+
+  const missionBeacon = new THREE.Group();
+  const beaconBeam = new THREE.Mesh(
+    new THREE.CylinderGeometry(10, 14, 260, 16, 1, true),
+    new THREE.MeshBasicMaterial({
+      color: 0xffd166,
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }),
+  );
+  beaconBeam.position.y = 130;
+  const beaconRing = new THREE.Mesh(
+    new THREE.TorusGeometry(18, 2.4, 8, 24).rotateX(Math.PI * 0.5),
+    new THREE.MeshBasicMaterial({ color: 0xffd166 }),
+  );
+  beaconRing.position.y = 2.5;
+  missionBeacon.add(beaconBeam, beaconRing);
+  missionBeacon.visible = false;
+  dynGroup.add(missionBeacon);
+
+  const vfxGroup = new THREE.Group();
+  scene.add(vfxGroup);
+  const vfxUnitSphere = new THREE.SphereGeometry(1, 10, 8);
+  const vfxTracerGeo = new THREE.CylinderGeometry(1.1, 1.1, 1, 6);
+  vfxTracerGeo.rotateX(Math.PI * 0.5);
+
+  function applyTimePhase(timeIndex) {
+    if (timeIndex === lastTimeIndex) return;
+    lastTimeIndex = timeIndex;
+    if (timeIndex === 0) {
+      // Golden Hour
+      skyMat.map = skyTextures.sunset;
+      scene.fog.color.setHex(0xd96b78);
+      scene.fog.density = 0.0004;
+      hemiLight.color.setHex(0xffc2aa);
+      hemiLight.groundColor.setHex(0x362452);
+      hemiLight.intensity = 1.18;
+      sunLight.color.setHex(0xffbc75);
+      sunLight.intensity = 2.2;
+      celestialMat.map = sunGlowTex;
+      celestialSprite.position.set(3550, 360, -150);
+      celestialSprite.scale.set(460, 460, 1);
+      for (const m of facadeMats) m.emissiveIntensity = 0.34;
+    } else if (timeIndex === 1) {
+      // Tropical Day
+      skyMat.map = skyTextures.day;
+      scene.fog.color.setHex(0x9ceeff);
+      scene.fog.density = 0.00028;
+      hemiLight.color.setHex(0xffffff);
+      hemiLight.groundColor.setHex(0x4b6e68);
+      hemiLight.intensity = 1.3;
+      sunLight.color.setHex(0xfff6dc);
+      sunLight.intensity = 2.3;
+      celestialMat.map = sunGlowTex;
+      celestialSprite.position.set(2800, 1250, 600);
+      celestialSprite.scale.set(360, 360, 1);
+      for (const m of facadeMats) m.emissiveIntensity = 0.12;
     } else {
-      // AC units & skylight
-      ctx.fillStyle = 'rgba(255,255,255,0.14)';
-      ctx.fillRect(rx + 12, ry + 12, 22, 16);
-      ctx.fillRect(rx + b.w - 34, ry + b.h - 28, 20, 14);
+      // Vibrant Neon Night
+      skyMat.map = skyTextures.night;
+      scene.fog.color.setHex(0x28134d);
+      scene.fog.density = 0.00042;
+      hemiLight.color.setHex(0x9c7aff);
+      hemiLight.groundColor.setHex(0x1f143b);
+      hemiLight.intensity = 1.05;
+      sunLight.color.setHex(0x96c2ff);
+      sunLight.intensity = 1.35;
+      celestialMat.map = moonGlowTex;
+      celestialSprite.position.set(3520, 460, -180);
+      celestialSprite.scale.set(380, 380, 1);
+      for (const m of facadeMats) m.emissiveIntensity = 0.68;
     }
-
-    // Glowing Neon Trim & Landmark Label
-    if (b.neon && lightsStrength > 0.2) {
-      ctx.save();
-      ctx.shadowColor = b.neon;
-      ctx.shadowBlur = 14 * lightsStrength;
-      ctx.strokeStyle = b.neon;
-      ctx.lineWidth = 2.5;
-      ctx.strokeRect(rx + 2, ry + 2, b.w - 4, b.h - 4);
-      ctx.restore();
-    }
-
-    if (b.label) {
-      ctx.fillStyle = 'rgba(12, 8, 26, 0.8)';
-      ctx.fillRect(rx + 6, ry + b.h - 22, b.w - 12, 17);
-      ctx.fillStyle = b.neon || '#ffffff';
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(b.label, rx + b.w * 0.5, ry + b.h - 13);
-    }
+    skyMat.needsUpdate = true;
+    celestialMat.needsUpdate = true;
   }
-}
 
-function drawQuad(ctx, x1, y1, x2, y2, x3, y3, x4, y4, fill) {
-  ctx.fillStyle = fill;
-  ctx.beginPath();
-  ctx.moveTo(x1, y1);
-  ctx.lineTo(x2, y2);
-  ctx.lineTo(x3, y3);
-  ctx.lineTo(x4, y4);
-  ctx.closePath();
-  ctx.fill();
-}
-
-function drawWallWindows(ctx, x1, y1, x2, y2, x3, y3, x4, y4, lightsStrength) {
-  // Draw glowing architectural window bands along the extruded facade
-  ctx.strokeStyle = lightsStrength > 0.2 ? `rgba(255, 240, 175, ${0.32 + lightsStrength * 0.28})` : 'rgba(24, 34, 52, 0.35)';
-  ctx.lineWidth = 2;
-  for (let f = 0.25; f <= 0.78; f += 0.26) {
-    const ax = x1 + (x4 - x1) * f;
-    const ay = y1 + (y4 - y1) * f;
-    const bx = x2 + (x3 - x2) * f;
-    const by = y2 + (y3 - y2) * f;
-    ctx.setLineDash([8, 7]);
-    ctx.beginPath();
-    ctx.moveTo(ax, ay);
-    ctx.lineTo(bx, by);
-    ctx.stroke();
+  function syncCharacterAnim(mesh, entity, shirtHex, pantsHex, filming = false) {
+    mesh.position.set(entity.x, 0, entity.y);
+    mesh.rotation.y = -entity.angle;
+    const sw = Math.sin(entity.walkCycle || 0) * 0.55;
+    mesh.userData.legL.rotation.z = sw;
+    mesh.userData.legR.rotation.z = -sw;
+    mesh.userData.armL.rotation.z = -sw * 0.7;
+    if (shirtHex) mesh.userData.shirtMat.color.set(shirtHex);
+    if (pantsHex) mesh.userData.pantsMat.color.set(pantsHex);
+    if (mesh.userData.phone) mesh.userData.phone.visible = filming;
   }
-  ctx.setLineDash([]);
-}
 
-function drawTrees(ctx, state, viewL, viewT, viewR, viewB, t) {
-  for (const tr of state.world.trees) {
-    if (tr.x < viewL - 60 || tr.x > viewR + 60 || tr.y < viewT - 60 || tr.y > viewB + 60) continue;
-    const sway = Math.sin(t * 1.8 + tr.phase) * 3;
-    ctx.save();
-    ctx.translate(tr.x, tr.y);
+  function updateCamera(state, dt) {
+    const active = state.heroes[state.player.activeId];
 
-    // Soft tree shadow
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
-    ctx.beginPath();
-    ctx.arc(8, 10, tr.radius * 0.85, 0, Math.PI * 2);
-    ctx.fill();
+    if (state.camera.override) {
+      const ov = state.camera.override;
+      camera.fov = ov.fov || 58;
+      camera.updateProjectionMatrix();
+      camera.position.set(ov.pos[0], ov.pos[1], ov.pos[2]);
+      camera.lookAt(ov.lookAt[0], ov.lookAt[1], ov.lookAt[2]);
+      return;
+    }
 
-    if (tr.kind === 'palm') {
-      // 7 swaying tropical palm fronds
-      for (let i = 0; i < 7; i++) {
-        const a = (i / 7) * Math.PI * 2 + sway * 0.03;
-        ctx.save();
-        ctx.rotate(a);
-        ctx.fillStyle = i % 2 === 0 ? '#2ec46b' : '#1fa358';
-        ctx.beginPath();
-        ctx.ellipse(tr.radius * 0.58, 0, tr.radius * 0.62, tr.radius * 0.22, 0, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      }
-      ctx.fillStyle = '#5c4033';
-      ctx.beginPath();
-      ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
-      ctx.fill();
-    } else if (tr.kind === 'pine') {
-      ctx.fillStyle = '#1f5e3b';
-      ctx.beginPath();
-      ctx.arc(sway * 0.3, 0, tr.radius, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#2d7a4f';
-      ctx.beginPath();
-      ctx.arc(sway * 0.5, 0, tr.radius * 0.65, 0, Math.PI * 2);
-      ctx.fill();
+    if (state.mode === 'title') {
+      const sway = Math.sin(state.time * 0.25) * 40;
+      camera.fov = 58;
+      camera.updateProjectionMatrix();
+      camera.position.set(3015 + sway, 46 + Math.sin(state.time * 0.35) * 5, 1780);
+      camera.lookAt(2840, 56, 1080);
+      return;
+    }
+
+    const shake = state.camera.shake > 0 ? (Math.random() - 0.5) * state.camera.shake * 0.7 : 0;
+
+    if (active.vehicle) {
+      const v = active.vehicle;
+      const desiredYaw = v.angle;
+      let diff = desiredYaw - state.camera.yaw;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      state.camera.yaw += diff * Math.min(1, dt * 5.2);
+
+      const dist = v.boat ? 128 : v.type === 'swat' ? 132 : 108;
+      const height = v.boat ? 40 : 38;
+      const cx = v.x - Math.cos(state.camera.yaw) * dist + shake;
+      const cz = v.y - Math.sin(state.camera.yaw) * dist + shake;
+      const lx = v.x + Math.cos(v.angle) * 68;
+      const lz = v.y + Math.sin(v.angle) * 68;
+
+      const targetFov = 58 + Math.min(16, (Math.abs(v.speed) / 520) * 10 + (v.nitroActive ? 8 : 0));
+      camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 6);
+      camera.updateProjectionMatrix();
+
+      camera.position.lerp(new THREE.Vector3(cx, height, cz), Math.min(1, dt * 10));
+      camera.lookAt(lx, 15, lz);
     } else {
-      // Cypress Marsh mossy tree
-      ctx.fillStyle = '#2b5e43';
-      ctx.beginPath();
-      ctx.arc(sway * 0.4, 0, tr.radius, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#4c8c5e';
-      ctx.beginPath();
-      ctx.arc(sway * 0.5, -2, tr.radius * 0.58, 0, Math.PI * 2);
-      ctx.fill();
+      const yaw = state.camera.yaw;
+      const pitch = state.camera.pitch ?? 0.32;
+      const dist = 68;
+      const shoulder = 12;
+      const cx = active.x - Math.cos(yaw) * dist - Math.sin(yaw) * shoulder + shake;
+      const cz = active.y - Math.sin(yaw) * dist + Math.cos(yaw) * shoulder + shake;
+      const cy = 22 + Math.sin(pitch) * dist * 0.78;
+      const lx = active.x + Math.cos(yaw) * 75;
+      const lz = active.y + Math.sin(yaw) * 75;
+
+      camera.fov += (56 - camera.fov) * Math.min(1, dt * 6);
+      camera.updateProjectionMatrix();
+
+      camera.position.lerp(new THREE.Vector3(cx, cy, cz), Math.min(1, dt * 12));
+      camera.lookAt(lx, 18, lz);
+    }
+  }
+
+  function screenToWorld(ndcX, ndcY) {
+    raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+    if (raycaster.ray.intersectPlane(groundPlane, rayHit)) {
+      return { x: rayHit.x, y: rayHit.z };
+    }
+    return null;
+  }
+
+  function resize() {
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+  }
+
+  function render(state, dt = 0.016) {
+    if (builtWorld !== state.world) buildStaticWorld(state.world);
+    applyTimePhase(state.timeIndex);
+
+    if (oceanTex) {
+      oceanTex.offset.x = (state.time * 0.03) % 1;
+      oceanTex.offset.y = (state.time * 0.02) % 1;
+    }
+    if (marshTex) {
+      marshTex.offset.x = (state.time * 0.012) % 1;
+    }
+    if (ufoMesh) {
+      ufoMesh.position.y = 104 + Math.sin(state.time * 2.2) * 8;
+      ufoMesh.userData.ringLights.rotation.y = state.time * 1.6;
+    }
+    if (beaconOrb) {
+      const s = 1 + Math.sin(state.time * 5) * 0.35;
+      beaconOrb.scale.set(s, s, s);
     }
 
-    ctx.restore();
-  }
-}
+    updateCamera(state, dt);
+    skyDome.position.set(camera.position.x, 0, camera.position.z);
+    sunLight.target.position.set(camera.position.x, 0, camera.position.z);
+    sunLight.position.set(camera.position.x + 480, 620, camera.position.z - 420);
 
-function drawMysteries(ctx, state, t) {
-  for (const m of state.world.mysteries) {
-    ctx.save();
-    ctx.translate(m.x, m.y);
-    if (m.id === 'ufo') {
-      // Hovering Swamp UFO with emerald tractor beam rings!
-      ctx.globalCompositeOperation = 'lighter';
-      const beam = ctx.createRadialGradient(0, 0, 12, 0, 0, 92);
-      beam.addColorStop(0, 'rgba(80, 255, 190, 0.58)');
-      beam.addColorStop(0.55, 'rgba(0, 229, 255, 0.26)');
-      beam.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      ctx.fillStyle = beam;
-      ctx.beginPath();
-      ctx.arc(0, 0, 92, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalCompositeOperation = 'source-over';
-
-      // Saucer hull
-      ctx.fillStyle = '#3b4a5e';
-      ctx.beginPath();
-      ctx.ellipse(0, Math.sin(t * 3) * 4, 34, 24, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#72efdd';
-      ctx.beginPath();
-      ctx.arc(0, Math.sin(t * 3) * 4, 13, 0, Math.PI * 2);
-      ctx.fill();
-      // Rotating rim lights
-      for (let i = 0; i < 6; i++) {
-        const a = t * 2.5 + (i / 6) * Math.PI * 2;
-        ctx.fillStyle = i % 2 === 0 ? '#5ef29d' : '#00e5ff';
-        ctx.beginPath();
-        ctx.arc(Math.cos(a) * 25, Math.sin(a) * 16 + Math.sin(t * 3) * 4, 3.2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    } else if (m.id === 'shipwreck') {
-      ctx.fillStyle = 'rgba(40, 25, 15, 0.6)';
-      ctx.rotate(0.4);
-      ctx.fillRect(-38, -14, 76, 28);
-      ctx.strokeStyle = 'rgba(255, 215, 100, 0.65)';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(0, 0, 26 + Math.sin(t * 3) * 6, 0, Math.PI * 2);
-      ctx.stroke();
-    } else if (m.id === 'beacon') {
-      ctx.strokeStyle = 'rgba(185, 103, 255, 0.72)';
-      ctx.lineWidth = 3;
-      for (let r = 20; r <= 75; r += 25) {
-        ctx.beginPath();
-        ctx.arc(0, 0, (r + t * 28) % 85, 0, Math.PI * 2);
-        ctx.stroke();
+    // Sync Vehicles
+    const activeVehicles = new Set(state.vehicles);
+    for (const [v, m] of vehicleMap.entries()) {
+      if (!activeVehicles.has(v) || v.dead) {
+        dynGroup.remove(m);
+        vehicleMap.delete(v);
       }
     }
-    ctx.restore();
+    const sirenFlash = Math.floor(state.time * 10) % 2 === 0;
+    for (const v of state.vehicles) {
+      if (v.dead) continue;
+      let m = vehicleMap.get(v);
+      if (!m) {
+        m = createVehicleMesh(v);
+        vehicleMap.set(v, m);
+        dynGroup.add(m);
+      }
+      m.position.set(v.x, v.boat ? 0.4 + Math.sin(state.time * 4 + v.x) * 0.6 : 0, v.y);
+      m.rotation.y = -v.angle;
+      if (m.userData.bodyMat && v.color) m.userData.bodyMat.color.set(v.color);
+      if (m.userData.nitro) m.userData.nitro.visible = Boolean(v.nitroActive);
+      if (m.userData.wake) m.userData.wake.visible = Math.abs(v.speed) > 45;
+      if (m.userData.sirenLight) {
+        if (v.sirenOn) {
+          m.userData.sirenLight.intensity = 7.5;
+          m.userData.sirenLight.color.setHex(sirenFlash ? 0xff1e42 : 0x00b8ff);
+          m.userData.redPod.material.color.setHex(sirenFlash ? 0xff2244 : 0x440812);
+          m.userData.bluePod.material.color.setHex(sirenFlash ? 0x082044 : 0x00c8ff);
+        } else {
+          m.userData.sirenLight.intensity = 0;
+        }
+      }
+    }
+
+    // Sync Dual Protagonists
+    const outfit = OUTFITS[state.player.outfitIndex] || OUTFITS[0];
+    for (const id of ['marco', 'elena']) {
+      const h = state.heroes[id];
+      const hm = heroMeshes[id];
+      if (h.vehicle) {
+        hm.visible = false;
+      } else {
+        hm.visible = true;
+        const shirt = id === 'marco' ? outfit.marcoShirt : outfit.elenaShirt;
+        syncCharacterAnim(hm, h, shirt, outfit.pants, false);
+      }
+    }
+
+    // Sync Pedestrians, Police Officers & Enemies
+    const liveChars = new Set();
+    const syncList = (arr, optsFn) => {
+      for (const e of arr) {
+        if (e.dead) continue;
+        liveChars.add(e);
+        let m = charMap.get(e);
+        if (!m) {
+          m = createCharacterMesh(optsFn(e));
+          charMap.set(e, m);
+          dynGroup.add(m);
+        }
+        syncCharacterAnim(m, e, null, null, Boolean(e.memory && e.memory.state === 'filming'));
+      }
+    };
+    syncList(state.pedestrians, (p) => ({ skin: p.skin, shirt: p.shirt, hair: p.hair, pants: '#272c3f', armed: false }));
+    syncList(state.police.officers, (c) => ({
+      skin: '#d9a480',
+      shirt: c.swat ? '#1c263b' : '#2556a0',
+      pants: '#111622',
+      hair: '#1a1a1a',
+      armed: true,
+    }));
+    syncList(state.enemies, () => ({ skin: '#cfa07e', shirt: '#d62828', pants: '#1b1d26', hair: '#1c1512', armed: true }));
+
+    for (const [e, m] of charMap.entries()) {
+      if (!liveChars.has(e)) {
+        dynGroup.remove(m);
+        charMap.delete(e);
+      }
+    }
+
+    // Sync Alligators
+    for (const g of state.wildlife.gators) {
+      let m = gatorMap.get(g);
+      if (g.dead) {
+        if (m) {
+          dynGroup.remove(m);
+          gatorMap.delete(g);
+        }
+        continue;
+      }
+      if (!m) {
+        m = createAlligatorMesh();
+        gatorMap.set(g, m);
+        dynGroup.add(m);
+      }
+      m.position.set(g.x, 0.5, g.y);
+      m.rotation.y = -g.angle;
+      m.userData.tail.rotation.y = Math.sin(g.swimPhase) * 0.35;
+    }
+
+    // Sync Helicopter
+    const heli = state.police.heli;
+    if (heli.active) {
+      heliMesh.visible = true;
+      heliMesh.position.set(heli.x, 126, heli.y);
+      heliMesh.rotation.y = -heli.angle;
+      heliMesh.userData.rotor.rotation.y = heli.rotor;
+    } else {
+      heliMesh.visible = false;
+    }
+
+    // Sync Mission Beacon
+    if (state.missions.marker) {
+      missionBeacon.visible = true;
+      missionBeacon.position.set(state.missions.marker.x, 0, state.missions.marker.y);
+      beaconRing.rotation.z = state.time * 2.2;
+    } else {
+      missionBeacon.visible = false;
+    }
+
+    // Sync 3D Combat VFX
+    while (vfxGroup.children.length > 0) vfxGroup.remove(vfxGroup.children[0]);
+
+    for (const b of state.combat.bullets) {
+      const dx = b.x - b.prevX;
+      const dy = b.y - b.prevY;
+      const len = Math.max(18, Math.hypot(dx, dy));
+      const tracer = new THREE.Mesh(vfxTracerGeo, new THREE.MeshBasicMaterial({ color: new THREE.Color(b.color || '#ffe680') }));
+      tracer.scale.set(1, 1, len);
+      tracer.position.set((b.x + b.prevX) * 0.5, 14, (b.y + b.prevY) * 0.5);
+      tracer.lookAt(b.x, 14, b.y);
+      vfxGroup.add(tracer);
+    }
+
+    for (const ex of state.combat.explosions) {
+      const t = Math.max(0.05, ex.life / ex.maxLife);
+      const r = Math.max(16, ex.r * 0.62);
+      const fire = new THREE.Mesh(
+        vfxUnitSphere,
+        new THREE.MeshBasicMaterial({ color: 0xff5a1f, transparent: true, opacity: t * 0.9 }),
+      );
+      fire.scale.set(r, r * 1.05, r);
+      fire.position.set(ex.x, r * 0.55, ex.y);
+      vfxGroup.add(fire);
+
+      const core = new THREE.Mesh(
+        vfxUnitSphere,
+        new THREE.MeshBasicMaterial({ color: 0xfff5a8, transparent: true, opacity: t }),
+      );
+      core.scale.set(r * 0.58, r * 0.62, r * 0.58);
+      core.position.set(ex.x, r * 0.48, ex.y);
+      vfxGroup.add(core);
+
+      const smoke = new THREE.Mesh(
+        vfxUnitSphere,
+        new THREE.MeshBasicMaterial({ color: 0x2b2330, transparent: true, opacity: t * 0.55 }),
+      );
+      smoke.scale.set(r * 0.72, r * 0.6, r * 0.72);
+      smoke.position.set(ex.x + 6, r * 1.45, ex.y - 4);
+      vfxGroup.add(smoke);
+    }
+
+    for (const p of state.combat.particles) {
+      const s = Math.max(1.8, p.size * 0.7);
+      const pm = new THREE.Mesh(
+        vfxUnitSphere,
+        new THREE.MeshBasicMaterial({ color: new THREE.Color(p.color || '#ffd166') }),
+      );
+      pm.scale.set(s, s, s);
+      pm.position.set(p.x, 12 + (1 - p.life / (p.maxLife || 1)) * 20, p.y);
+      vfxGroup.add(pm);
+    }
+
+    renderer.render(scene, camera);
   }
-}
 
-function drawCombatVFX(ctx, state) {
-  // Bullet tracers
-  ctx.lineWidth = 3;
-  for (const b of state.combat.bullets) {
-    ctx.strokeStyle = b.color;
-    ctx.beginPath();
-    ctx.moveTo(b.prevX, b.prevY);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
-  }
-
-  // Particles
-  for (const p of state.combat.particles) {
-    ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
-    ctx.fillStyle = p.color;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.globalAlpha = 1;
-
-  // Explosion shockwaves
-  for (const ex of state.combat.explosions) {
-    const a = ex.life / ex.maxLife;
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    const g = ctx.createRadialGradient(ex.x, ex.y, 4, ex.x, ex.y, ex.r);
-    g.addColorStop(0, `rgba(255, 250, 190, ${a})`);
-    g.addColorStop(0.5, `rgba(255, 105, 50, ${a * 0.85})`);
-    g.addColorStop(1, 'rgba(255, 40, 90, 0)');
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.arc(ex.x, ex.y, ex.r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // Floating Cash / Clout Popups
-  ctx.font = 'bold 14px sans-serif';
-  ctx.textAlign = 'center';
-  for (const pop of state.combat.popups) {
-    ctx.globalAlpha = Math.min(1, pop.life);
-    ctx.fillStyle = '#0a0714';
-    ctx.fillText(pop.text, pop.x + 1, pop.y + 1);
-    ctx.fillStyle = pop.color;
-    ctx.fillText(pop.text, pop.x, pop.y);
-  }
-  ctx.globalAlpha = 1;
-}
-
-function drawBirdsAndHeli(ctx, state, t) {
-  // Pelicans / Seagulls
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = 2.2;
-  for (const b of state.wildlife.birds) {
-    const wing = Math.sin(b.flap) * b.size;
-    ctx.save();
-    ctx.translate(b.x, b.y);
-    ctx.rotate(b.angle);
-    ctx.beginPath();
-    ctx.moveTo(-b.size, -wing);
-    ctx.quadraticCurveTo(0, -3, b.size, 0);
-    ctx.quadraticCurveTo(0, 3, -b.size, wing);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // 4-5 Star Police Helicopter & Searchlight Cone
-  const heli = state.police.heli;
-  if (heli.active) {
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    const sg = ctx.createRadialGradient(heli.lightX, heli.lightY, 10, heli.lightX, heli.lightY, 115);
-    sg.addColorStop(0, 'rgba(220, 245, 255, 0.45)');
-    sg.addColorStop(1, 'rgba(0, 210, 255, 0)');
-    ctx.fillStyle = sg;
-    ctx.beginPath();
-    ctx.arc(heli.lightX, heli.lightY, 115, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-
-    ctx.save();
-    ctx.translate(heli.x, heli.y);
-    ctx.rotate(heli.angle);
-    ctx.fillStyle = '#182236';
-    roundRect(ctx, -26, -11, 46, 22, 8);
-    ctx.fill();
-    ctx.fillRect(-48, -3, 24, 6);
-    // Spinning rotor blades
-    ctx.rotate(heli.rotor);
-    ctx.strokeStyle = 'rgba(220, 235, 255, 0.72)';
-    ctx.lineWidth = 4;
-    ctx.beginPath();
-    ctx.moveTo(-42, 0);
-    ctx.lineTo(42, 0);
-    ctx.moveTo(0, -42);
-    ctx.lineTo(0, 42);
-    ctx.stroke();
-    ctx.restore();
-  }
-}
-
-function roundRect(ctx, x, y, w, h, r) {
-  const rad = Math.min(r, w * 0.5, h * 0.5);
-  ctx.beginPath();
-  ctx.moveTo(x + rad, y);
-  ctx.arcTo(x + w, y, x + w, y + h, rad);
-  ctx.arcTo(x + w, y + h, x, y + h, rad);
-  ctx.arcTo(x, y + h, x, y, rad);
-  ctx.arcTo(x, y, x + w, y, rad);
-  ctx.closePath();
+  return { render, resize, screenToWorld, camera };
 }

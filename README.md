@@ -8,7 +8,8 @@
 
 ## Highlights
 
-- **6 Interconnected Districts**: Bayside Strip, Coral Keys, Cypress Marsh, Harbor Point, Solara Flats, and Pineridge Overlook — rendered in high-contrast 2.5D perspective with dynamic Golden Hour, Tropical Day, and Neon Night lighting.
+- **True 3D WebGL Engine (Three.js)**: Full third-person 3D open world with over-the-shoulder on-foot camera, dynamic speed-reactive vehicle chase camera, procedural Art Deco skyscrapers, animated turquoise ocean, and dynamic Golden Hour, Tropical Day, and Neon Night skies.
+- **6 Interconnected 3D Districts**: Bayside Strip, Coral Keys, Cypress Marsh, Harbor Point, Solara Flats, and Pineridge Overlook — seamlessly explorable by car, motorcycle, speedboat, or on foot.
 - **Dual Protagonists (`Tab`)**: Switch live between Marco Vega and Elena Cruz anytime; your partner AI follows, rides passenger, and lays down covering fire in gunfights.
 - **Vehicles, Boats & Auto Mod Garage (`F` / `E`)**: Steal and drive Neon Coupes, Muscle Cars, Motorcycles, SUVs, Taxis, SC-PD Interceptors, SWAT Vans, and KeyRunner Speedboats. Repaint cars, bolt on Twin-Turbo upgrades, and swap `HOT PLATE` tags to shake police heat.
 - **1–5 Star Wanted System & Living World**: Escalating SC-PD pursuit cruisers, on-foot officers, SWAT vans, and a sweeping 4–5 star Helicopter Searchlight — plus pedestrians with daily routines & NPC witness memory (fleeing or filming you on phones) and patrolling Cypress Marsh alligators.

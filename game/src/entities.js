@@ -152,12 +152,16 @@ export function alertWitnesses(state, cx, cy, crimeType = 'shootout') {
 
 export function updateActiveHeroOnFoot(state, hero, dt) {
   const input = state.input;
-  let mx = 0;
-  let my = 0;
-  if (input.isDown('KeyW') || input.isDown('ArrowUp')) my -= 1;
-  if (input.isDown('KeyS') || input.isDown('ArrowDown')) my += 1;
-  if (input.isDown('KeyA') || input.isDown('ArrowLeft')) mx -= 1;
-  if (input.isDown('KeyD') || input.isDown('ArrowRight')) mx += 1;
+  let fwd = 0;
+  let right = 0;
+  if (input.isDown('KeyW') || input.isDown('ArrowUp')) fwd += 1;
+  if (input.isDown('KeyS') || input.isDown('ArrowDown')) fwd -= 1;
+  if (input.isDown('KeyA') || input.isDown('ArrowLeft')) right -= 1;
+  if (input.isDown('KeyD') || input.isDown('ArrowRight')) right += 1;
+
+  const yaw = state.camera.yaw ?? -Math.PI * 0.5;
+  const mx = Math.cos(yaw) * fwd - Math.sin(yaw) * right;
+  const my = Math.sin(yaw) * fwd + Math.cos(yaw) * right;
 
   const mag = Math.hypot(mx, my);
   const inWater = isWaterAt(hero.x, hero.y);
@@ -177,7 +181,7 @@ export function updateActiveHeroOnFoot(state, hero, dt) {
   hero.x = col.x;
   hero.y = col.y;
 
-  // Aim toward mouse in world space
+  // Aim toward 3D mouse raycast target in world space
   hero.angle = Math.atan2(input.mouse.worldY - hero.y, input.mouse.worldX - hero.x);
   if (hero.hitFlash > 0) hero.hitFlash = Math.max(0, hero.hitFlash - dt);
 }

@@ -1,4 +1,4 @@
-// Main game loop, UI wiring, enterable interiors, protagonist switching & shot bootstrap.
+// Main game loop, 3D WebGL renderer bootstrap, UI wiring, enterable interiors & protagonist switching.
 import { createAudio } from './audio.js';
 import { addPopup, createCombatState, fireBullet, reloadWeapon, tryPlayerFire, updateCombat } from './combat.js';
 import { OUTFITS, PAINT_OPTIONS, PROTAGONISTS, TIME_PHASES, WEAPONS } from './config.js';
@@ -16,7 +16,7 @@ import { createHUD } from './hud.js';
 import { createInput } from './input.js';
 import { createMissionState, startMission, updateMissionsAndWorld } from './missions.js';
 import { addWanted, clearWanted, createPoliceState, updatePolice } from './police.js';
-import { renderGame } from './renderer.js';
+import { createRenderer3D } from './renderer.js';
 import { hasSave, loadGame, saveGame } from './save.js';
 import { applyShotScene } from './shots.js';
 import { createSocial, postSolagram, sayDialogue, updateSocial } from './social.js';
@@ -25,7 +25,8 @@ import { generatePlate, updatePlayerVehicle, updateVehicleCollisions } from './v
 import { createWorld } from './world.js';
 
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+const crosshairEl = document.getElementById('crosshair');
+const renderer3D = createRenderer3D(canvas);
 const input = createInput(canvas);
 const hud = createHUD();
 const audio = createAudio();
@@ -41,14 +42,7 @@ const interiorModal = document.getElementById('interior-modal');
 const btnContinue = document.getElementById('btn-continue');
 const saveToast = document.getElementById('save-toast');
 
-function resize() {
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.floor(window.innerWidth * dpr);
-  canvas.height = Math.floor(window.innerHeight * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-window.addEventListener('resize', resize);
-resize();
+window.addEventListener('resize', () => renderer3D.resize());
 
 function createInitialState(seed = 1) {
   const world = createWorld(seed);
@@ -78,7 +72,7 @@ function createInitialState(seed = 1) {
       mag: [0, 12, 30, 6, 28],
       ammo: [0, 96, 150, 30, 112],
     },
-    camera: { x: 2760, y: 1520, shake: 0 },
+    camera: { x: 2760, y: 1520, yaw: -Math.PI * 0.5, pitch: 0.3, shake: 0, override: null },
     input,
     audio,
     activeInterior: null,
@@ -91,6 +85,7 @@ const ui = {
   showStart(hasSavedOverride = null) {
     startScreen.classList.remove('hidden');
     hud.els.hud.classList.add('hidden');
+    crosshairEl.classList.add('hidden');
     pauseMenu.classList.add('hidden');
     interiorModal.classList.add('hidden');
     btnContinue.disabled = hasSavedOverride !== null ? !hasSavedOverride : !hasSave();
@@ -104,6 +99,7 @@ const ui = {
   },
   showPause() {
     state.mode = 'paused';
+    crosshairEl.classList.add('hidden');
     saveToast.textContent = '';
     const stats = document.getElementById('pause-stats');
     const found = state.world.mysteries.filter((m) => m.discovered).length;
@@ -118,6 +114,7 @@ function startNewGame() {
   state.mode = 'playing';
   state.camera.x = state.heroes.marco.x;
   state.camera.y = state.heroes.marco.y;
+  state.camera.yaw = -Math.PI * 0.5;
   startMission(state, 0);
   ui.showHUD();
 }
@@ -151,12 +148,14 @@ function continueSavedGame() {
   const h = state.heroes[state.player.activeId];
   state.camera.x = h.x;
   state.camera.y = h.y;
+  state.camera.yaw = -Math.PI * 0.5;
   ui.showHUD();
 }
 
 function openInterior(interior) {
   state.mode = 'interior';
   state.activeInterior = interior;
+  crosshairEl.classList.add('hidden');
   document.getElementById('int-badge').textContent = interior.badge;
   document.getElementById('int-title').textContent = interior.name;
   document.getElementById('int-desc').textContent = interior.desc;
@@ -405,9 +404,28 @@ function updatePlaying(dt) {
 
   const active = state.heroes[state.player.activeId];
 
-  // Update world mouse coordinates
-  input.mouse.worldX = state.camera.x - window.innerWidth * 0.5 + input.mouse.screenX;
-  input.mouse.worldY = state.camera.y - window.innerHeight * 0.5 + input.mouse.screenY;
+  // 3D On-foot mouse orbit (right-drag or Q/C keys) + 3D raycast aim
+  if (!active.vehicle) {
+    if (input.mouse.rightDown) {
+      state.camera.yaw += input.mouse.dx * 0.0055;
+      state.camera.pitch = Math.max(0.14, Math.min(0.68, state.camera.pitch + input.mouse.dy * 0.004));
+    }
+    if (input.isDown('KeyQ')) state.camera.yaw -= dt * 2.1;
+    if (input.isDown('KeyC')) state.camera.yaw += dt * 2.1;
+    crosshairEl.classList.remove('hidden');
+  } else {
+    crosshairEl.classList.add('hidden');
+  }
+
+  // Raycast mouse into 3D world plane for crisp aiming
+  const hit = renderer3D.screenToWorld(input.mouse.ndcX, input.mouse.ndcY);
+  if (hit) {
+    input.mouse.worldX = hit.x;
+    input.mouse.worldY = hit.y;
+  } else {
+    input.mouse.worldX = active.x + Math.cos(state.camera.yaw) * 160;
+    input.mouse.worldY = active.y + Math.sin(state.camera.yaw) * 160;
+  }
 
   // Player movement or driving
   if (active.vehicle) {
@@ -415,7 +433,6 @@ function updatePlaying(dt) {
     active.x = active.vehicle.x;
     active.y = active.vehicle.y;
     active.angle = active.vehicle.angle;
-    // Long drift viral Solagram post!
     if (active.vehicle.driftAccum > 1.8 && state.social.cooldown <= 0) {
       active.vehicle.driftAccum = 0;
       postSolagram(state, `Insane neon drift in a ${active.vehicle.name} down Solara Coast! #NeonDrift`, 260, '@neon_drift');
@@ -455,24 +472,20 @@ function updatePlaying(dt) {
     sayDialogue(state, state.player.activeId === 'marco' ? 'ELENA' : 'MARCO', 'Patched you up at Bayside Safehouse. Take it easy.');
   }
 
-  // Smooth camera with lookahead
-  const targetX = active.x + (active.vehicle ? active.vehicle.vx * 0.22 : 0);
-  const targetY = active.y + (active.vehicle ? active.vehicle.vy * 0.22 : 0);
-  state.camera.x += (targetX - state.camera.x) * Math.min(1, dt * 6.5);
-  state.camera.y += (targetY - state.camera.y) * Math.min(1, dt * 6.5);
+  state.camera.x = active.x;
+  state.camera.y = active.y;
   state.camera.shake = Math.max(0, state.camera.shake - dt * 24);
 
   hud.update(state, ctxPrompt.text);
 }
 
-// Initialize Title Screen or Deterministic Shot Mode
+// Initialize Title Screen or Deterministic 3D Shot Mode
 if (shotParam) {
   applyShotScene(state, shotParam, ui);
   hud.update(state, '');
-  renderGame(ctx, state, window.innerWidth, window.innerHeight);
+  renderer3D.render(state, 0.016);
 } else {
-  // Live animated neon city panorama on Start Screen
-  state.timeIndex = 2;
+  state.timeIndex = 2; // Neon Night Start Screen Vista
   ui.showStart();
 }
 
@@ -485,8 +498,6 @@ function loop(ts) {
     if (state.mode === 'title') {
       state.time += dt;
       updateTraffic(state, dt);
-      state.camera.x = 2760 + Math.sin(state.time * 0.14) * 140;
-      state.camera.y = 1520 + Math.cos(state.time * 0.11) * 120;
     } else if (state.mode === 'playing') {
       updatePlaying(dt);
     } else if (state.mode === 'interior' || state.mode === 'paused') {
@@ -496,10 +507,10 @@ function loop(ts) {
         state.mode = 'playing';
       }
     }
-    renderGame(ctx, state, window.innerWidth, window.innerHeight);
+    renderer3D.render(state, dt);
     input.endFrame();
   } else {
-    renderGame(ctx, state, window.innerWidth, window.innerHeight);
+    renderer3D.render(state, 0.016);
   }
   requestAnimationFrame(loop);
 }
